@@ -1,92 +1,133 @@
 const mineflayer = require('mineflayer');
-const { server, io } = require('./server');
+const { io } = require('./server');
 
 let bot = null;
-let autoReconnect = true;
-let isStarted = false;
+let reconnectTimer = null;
+let isManualStop = true; // Mặc định là dừng cho đến khi nhấn nút
 
-function log(msg, type = 'success') {
-    console.log(msg);
-    io.emit('log', { msg, type });
+// Hàm gửi log về Web Panel với phân loại loại log
+function sendLog(text, type = 'info') {
+    // type: 'success', 'move', 'err', 'info'
+    console.log(`[${type.toUpperCase()}] ${text}`);
+    io.emit('log', { text, type });
 }
 
 function createBot() {
-    if (bot) return;
+    // Kiểm tra nếu bot đang trong server thì không tạo thêm để tránh lỗi reconnect liên tục
+    if (bot) {
+        sendLog('Bot đang hoạt động, không thể khởi động thêm!', 'err');
+        return;
+    }
 
+    isManualStop = false;
+    
     bot = mineflayer.createBot({
-        host: 'IP_CUA_BAN', // Thay IP vào đây
+        host: 'korules.mcsh.io',
         port: 25565,
         username: 'bot123',
-        version: '1.20.1',
+        version: '1.20.1', // Dùng bản này cực mượt trên 0.1 vCPU
         viewDistance: 'tiny'
     });
 
-    log('Đang kết nối đến server...', 'move');
+    sendLog('Đang thực hiện kết nối đến server korules.mcsh.io...', 'info');
 
     bot.on('spawn', () => {
-        isStarted = true;
-        io.emit('updateStatus', true);
-        log('Bot đã vào server thành công!', 'success');
+        io.emit('status', true);
+        sendLog('Bot đã online thành công!', 'success');
+        
+        // Tự động Login AuthMe
         bot.chat('/login 11111111');
-        startAntiAFK();
+        
+        // Kích hoạt chu kỳ Anti-AFK
+        runAntiAFK();
     });
 
+    // Xử lý tự động hồi sinh khi chết (Auto Respawn)
     bot.on('death', () => {
-        log('Bot đã hy sinh, tự động hồi sinh...', 'err');
+        sendLog('Bot đã bị hạ gục! Đang tự động hồi sinh...', 'err');
+        bot.respawn();
     });
 
-    bot.on('error', (err) => log('Lỗi: ' + err.message, 'err'));
+    // Xử lý lỗi kết nối
+    bot.on('error', (err) => {
+        sendLog('Lỗi hệ thống: ' + err.message, 'err');
+    });
 
-    bot.on('end', () => {
+    // Xử lý khi bị Kick hoặc Disconnect
+    bot.on('end', (reason) => {
+        io.emit('status', false);
         bot = null;
-        io.emit('updateStatus', false);
-        log('Mất kết nối với server.', 'err');
-        if (autoReconnect) {
-            log('Sẽ thử kết nối lại sau 5 giây...', 'move');
-            setTimeout(createBot, 5000);
+        sendLog(`Bot đã ngắt kết nối. Lý do: ${reason}`, 'err');
+
+        // Nếu không phải do người dùng chủ động dừng thì tự động reconnect sau 5s
+        if (!isManualStop) {
+            sendLog('Chế độ Auto-Reconnect: Đang thử lại sau 5 giây...', 'info');
+            clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(createBot, 5000);
         }
     });
 }
 
-function startAntiAFK() {
-    if (!bot) return;
+// Cơ chế Anti-AFK phong cách Wurst Client
+function runAntiAFK() {
+    const afkInterval = setInterval(() => {
+        if (!bot || !bot.entity) {
+            clearInterval(afkInterval);
+            return;
+        }
 
-    // Cơ chế xoay đầu và đi bộ ngẫu nhiên
-    setInterval(() => {
-        if (!bot || !bot.entity) return;
+        // 1. Xoay màn hình ngẫu nhiên (Quay đầu)
+        const yaw = (Math.random() * 360) * (Math.PI / 180);
+        const pitch = ((Math.random() * 40) - 20) * (Math.PI / 180);
+        bot.look(yaw, pitch);
 
-        // Xoay đầu ngẫu nhiên
-        const yaw = Math.random() * Math.PI * 2;
-        bot.look(yaw, 0);
+        // 2. Tính toán vị trí phía trước để kiểm tra nước
+        const forward = bot.entity.position.offset(
+            -Math.sin(yaw) * 2, 
+            -1, 
+            -Math.cos(yaw) * 2
+        );
+        const block = bot.blockAt(forward);
 
-        // Kiểm tra block phía trước có phải nước không
-        const posFront = bot.entity.position.offset(-Math.sin(yaw), 0, -Math.cos(yaw));
-        const block = bot.blockAt(posFront);
-
-        if (block && block.name !== 'water') {
+        // 3. Di chuyển nếu an toàn (Không phải nước, không phải không khí/vực)
+        if (block && block.name !== 'water' && block.name !== 'flow_water' && block.name !== 'air') {
             bot.setControlState('forward', true);
-            log(`Di chuyển đến: ${posFront.x.toFixed(0)}, ${posFront.z.toFixed(0)}`, 'move');
-            setTimeout(() => { if(bot) bot.setControlState('forward', false); }, 2000);
+            sendLog(`Di chuyển đến tọa độ: ${forward.x.toFixed(0)}, ${forward.z.toFixed(0)}`, 'move');
+            
+            // Đi trong 2 giây rồi dừng
+            setTimeout(() => {
+                if (bot) bot.setControlState('forward', false);
+            }, 2000);
         } else {
-            log('Phía trước là nước, đang tìm hướng khác...', 'err');
+            sendLog('Phát hiện nước hoặc vực thẳm phía trước! Đang tìm hướng khác...', 'err');
         }
-    }, 15000); // Mỗi 15 giây thực hiện 1 lần
+    }, 15000); // Lặp lại sau mỗi 15 giây
 }
 
+// Nhận lệnh từ giao diện Web (server.js)
 io.on('connection', (socket) => {
-    socket.emit('updateStatus', !!bot);
-    socket.on('startBot', () => {
-        autoReconnect = true;
-        createBot();
-    });
-    socket.on('stopBot', () => {
-        autoReconnect = false;
-        if (bot) bot.quit();
-        log('Đã dừng bot thủ công.', 'err');
-    });
-});
+    // Cập nhật trạng thái nút bấm cho người dùng mới vào web
+    socket.emit('status', bot !== null);
 
-const PORT = process.env.PORT || 7860;
-server.listen(PORT, () => {
-    console.log('Server Web chạy trên port ' + PORT);
+    // Lệnh Khởi động
+    socket.on('start-bot', () => {
+        if (!bot) {
+            sendLog('Lệnh khởi động được kích hoạt từ Web.', 'info');
+            createBot();
+        } else {
+            sendLog('Bot đã ở trong server, không cần khởi động lại.', 'err');
+        }
+    });
+
+    // Lệnh Dừng
+    socket.on('stop-bot', () => {
+        isManualStop = true;
+        clearTimeout(reconnectTimer);
+        if (bot) {
+            bot.quit();
+            bot = null;
+        }
+        io.emit('status', false);
+        sendLog('Đã dừng bot thủ công và tắt Auto-Reconnect.', 'err');
+    });
 });
