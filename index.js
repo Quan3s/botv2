@@ -1,12 +1,50 @@
 const mineflayer = require('mineflayer');
 const { io } = require('./server');
+const fs = require('fs');
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 let bot = null;
-let reconnectTimer = null;
 let isManualStop = true;
+let keys = [];
+let currentKeyIndex = 0;
 
+// --- LOGIC ĐỌC VÀ XOAY KEY ---
+function loadKeys() {
+    try {
+        const data = fs.readFileSync('key.txt', 'utf8');
+        keys = data.split(/\r?\n/).filter(k => k.trim() !== "");
+        console.log(`Đã nạp ${keys.length} API Keys.`);
+    } catch (err) {
+        console.log("Không tìm thấy file key.txt hoặc file trống!");
+    }
+}
+loadKeys();
+
+async function getGeminiResponse(prompt) {
+    if (keys.length === 0) return "Không có API Key.";
+
+    try {
+        const genAI = new GoogleGenerativeAI(keys[currentKeyIndex]);
+        const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+        const result = await model.generateContent(prompt);
+        return result.response.text();
+    } catch (error) {
+        // Nếu lỗi 429 (Hết hạn mức) hoặc lỗi quyền
+        if (error.message.includes("429") || error.message.includes("quota")) {
+            console.log(`Key thứ ${currentKeyIndex + 1} hết hạn mức. Đang đổi key...`);
+            currentKeyIndex++;
+            if (currentKeyIndex >= keys.length) {
+                currentKeyIndex = 0; // Quay lại key đầu tiên hoặc báo hết
+                return "Tất cả API keys đều đã hết hạn mức.";
+            }
+            return getGeminiResponse(prompt); // Thử lại với key mới
+        }
+        return "Lỗi AI: " + error.message;
+    }
+}
+
+// --- LOGIC BOT CHÍNH ---
 function sendLog(text, type = 'info') {
-    console.log(`[${type.toUpperCase()}] ${text}`);
     io.emit('log', { text, type });
 }
 
@@ -19,94 +57,64 @@ function createBot() {
         port: 25565,
         username: 'bot123',
         version: '1.20.1',
-        viewDistance: 'tiny',
-        // Thêm dòng này để xử lý vật lý tốt hơn trên máy yếu
-        physicsEnabled: true 
+        physicsEnabled: true
     });
-
-    sendLog('Đang kết nối...', 'info');
 
     bot.on('spawn', () => {
         io.emit('status', true);
-        sendLog('Bot đã online!', 'success');
-        
-        // Đợi 2 giây để server gửi dữ liệu map rồi mới login và chạy
+        sendLog('Bot đã online với Gemini AI!', 'success');
         setTimeout(() => {
             bot.chat('/login 11111111');
-            sendLog('Đã gửi lệnh đăng nhập.', 'success');
             runAntiAFK();
         }, 2000);
     });
 
-    // Sửa lỗi đứng lơ lửng: Cập nhật vật lý khi bot di chuyển
+    // Chat với AI khi có người nhắn tên bot
+    bot.on('chat', async (username, message) => {
+        if (username === bot.username) return;
+        if (message.includes(bot.username)) {
+            const reply = await getGeminiResponse(message);
+            bot.chat(reply.substring(0, 255)); // Minecraft giới hạn 255 ký tự
+        }
+    });
+
     bot.on('move', () => {
-        if (bot.physics.gravity === 0) bot.physics.gravity = 1.6; // Đảm bảo trọng lực luôn bật
+        if (bot.physics && bot.physics.gravity === 0) bot.physics.gravity = 1.6;
     });
 
-    bot.on('death', () => {
-        sendLog('Bot đã chết, đang hồi sinh...', 'err');
-        bot.respawn();
-    });
-
-    bot.on('end', (reason) => {
+    bot.on('end', () => {
         io.emit('status', false);
         bot = null;
-        if (!isManualStop) {
-            sendLog('Mất kết nối. Thử lại sau 5s...', 'info');
-            clearTimeout(reconnectTimer);
-            reconnectTimer = setTimeout(createBot, 5000);
-        }
+        if (!isManualStop) setTimeout(createBot, 5000);
     });
 }
 
+// Giữ nguyên hàm runAntiAFK() từ bản trước của bạn ở đây...
 function runAntiAFK() {
-    const afkInterval = setInterval(() => {
-        if (!bot || !bot.entity) {
-            clearInterval(afkInterval);
-            return;
-        }
-
-        // 1. Quay đầu ngẫu nhiên
+    setInterval(() => {
+        if (!bot || !bot.entity) return;
         const yaw = Math.random() * Math.PI * 2;
-        const pitch = (Math.random() - 0.5) * 0.5;
-        bot.look(yaw, pitch, true); // true để quay đầu mượt hơn
+        bot.look(yaw, (Math.random() - 0.5) * 0.5, true);
 
-        // 2. Kiểm tra block phía dưới và phía trước
-        // Lấy block tại vị trí bot đang đứng để cập nhật trọng lực
-        const currentBlock = bot.blockAt(bot.entity.position);
-        
-        // Tính toán vị trí di chuyển (Wurst Style)
-        const moveX = -Math.sin(yaw) * 2;
-        const moveZ = -Math.cos(yaw) * 2;
-        const targetPos = bot.entity.position.offset(moveX, 0, moveZ);
+        const targetPos = bot.entity.position.offset(-Math.sin(yaw) * 2, 0, -Math.cos(yaw) * 2);
         const blockFront = bot.blockAt(targetPos);
         const blockDown = bot.blockAt(targetPos.offset(0, -1, 0));
 
-        // 3. Logic di chuyển: Chỉ đi nếu phía trước không phải nước và phía dưới có sàn
         if (blockFront && blockFront.name !== 'water' && blockDown && blockDown.name !== 'air') {
             bot.setControlState('forward', true);
-            // Thêm nhảy nhẹ để kích hoạt vật lý
-            bot.setControlState('jump', true); 
-            
-            sendLog(`Đang di chuyển & quay đầu (Yaw: ${yaw.toFixed(2)})`, 'move');
-            
+            bot.setControlState('jump', true);
             setTimeout(() => {
                 if (bot) {
                     bot.setControlState('forward', false);
                     bot.setControlState('jump', false);
                 }
             }, 1000);
-        } else {
-            sendLog('Phát hiện vùng không an toàn, đang tính toán lại hướng...', 'info');
         }
-    }, 10000); // Rút ngắn thời gian xuống 10s để bot linh hoạt hơn
+    }, 15000);
 }
 
 io.on('connection', (socket) => {
     socket.emit('status', bot !== null);
-    socket.on('start-bot', () => { if (!bot) createBot(); });
-    socket.on('stop-bot', () => {
-        isManualStop = true;
-        if (bot) bot.quit();
-    });
+    socket.on('start-bot', () => createBot());
+    socket.on('stop-bot', () => { isManualStop = true; if (bot) bot.quit(); });
 });
